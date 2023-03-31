@@ -1,4 +1,4 @@
-//! This crate provides interoperability between Rust and Haxe programming language.
+//! This crate provides callback-based interoperability between Rust and C ABI-compatible language.
 #![warn(
     clippy::all,
     deprecated_in_future,
@@ -10,112 +10,126 @@
     unreachable_pub
 )]
 
-mod ffi;
-
-use std::thread::{self, JoinHandle};
-
-use bytes::Bytes;
-use kanal::{Receiver, Sender};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use tokio::runtime::{Handle, Runtime};
+use rosc::address::{self, Matcher, OscAddress};
+use rosc::{OscError, OscMessage, OscPacket, OscType};
 use ustr::{Ustr, UstrMap};
 
 pub(crate) static CALLBACK_STORAGE: Lazy<RwLock<UstrMap<Callback>>> =
     Lazy::new(|| RwLock::new(UstrMap::default()));
-static TOKIO_RUNTIME: Lazy<Runtime> =
-    Lazy::new(|| Runtime::new().expect("Error creating tokio runtime"));
-pub(crate) static CHANNEL: Lazy<(Sender<Message>, Receiver<Message>)> =
-    Lazy::new(|| kanal::unbounded());
 
-pub(crate) struct Callback(extern "C" fn(*const u8));
+#[derive(Debug, Clone, Copy)]
+struct Callback(fn(OscType));
 
 impl Callback {
-    pub(crate) fn call(&self, data: &[u8]) {
-        (self.0)(data.as_ptr());
+    fn call(&self, data: OscType) {
+        (self.0)(data);
     }
 }
 
-/// Implement this trait for the type which will handle events.
-pub trait Dispatcher: Send + Sync + 'static {
-    /// Called when an event is received.
-    fn receive<'de, Data: Deserialize<'de>>(&self, event: Ustr, data: Data);
+/// Listen for messages on address.
+pub fn listen(address: Ustr, callback: fn(OscType)) -> Result<(), OscError> {
+    address::verify_address(&address)?;
+    let mut storage = CALLBACK_STORAGE.write();
+    (*storage).insert(address, Callback(callback));
 
-    /// Send an event to the Haxe side.
-    fn send<Data: Serialize>(&self, event: Ustr, data: Data) -> Result<(), Error> {
-        let storage = CALLBACK_STORAGE.read();
+    Ok(())
+}
 
-        match storage.get(&event) {
-            Some(callback) => {
-                let bytes = bincode::serialize(&data)?;
-                callback.call(&bytes);
-                Ok(())
+/// Send message.
+pub fn send(message: OscMessage) -> Result<(), OscError> {
+    let storage = ffi::CALLBACK_STORAGE.read();
+    let matcher = Matcher::new(&message.addr)?;
+    let packet = OscPacket::Message(message);
+    let bytes = rosc::encoder::encode(&packet)?;
+
+    storage
+        .iter()
+        .filter_map(|(key, val)| {
+            let address = OscAddress::new(key.to_string()).unwrap();
+            if matcher.match_address(&address) {
+                Some(val)
+            } else {
+                None
             }
-            None => Err(Error::CallbackNotFound(event)),
+        })
+        .for_each(|callback| callback.call(&bytes));
+
+    Ok(())
+}
+
+/// Stop listening for events on address.
+pub fn unlisten(address: Ustr) {
+    let mut storage = CALLBACK_STORAGE.write();
+    (*storage).remove(&address);
+}
+
+mod ffi {
+    #![allow(unreachable_pub)]
+
+    use std::ffi::{c_char, CStr};
+
+    use once_cell::sync::Lazy;
+    use parking_lot::RwLock;
+    use rosc::address::{self, Matcher, OscAddress};
+    use rosc::OscPacket;
+    use ustr::{Ustr, UstrMap};
+
+    pub(crate) static CALLBACK_STORAGE: Lazy<RwLock<UstrMap<Callback>>> =
+        Lazy::new(|| RwLock::new(UstrMap::default()));
+
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Callback(extern "C" fn(*const u8));
+
+    impl Callback {
+        pub(crate) fn call(&self, data: &[u8]) {
+            (self.0)(data.as_ptr());
         }
     }
-}
 
-/// Start the event loop in the async runtime.
-///
-/// The function returns a [`Handle`], which can be used to spawn tasks.
-pub fn start_async<D: Dispatcher>(dispatcher: D) -> Result<Handle, Error> {
-    let handle = async_runtime_handle();
+    #[no_mangle]
+    pub extern "C" fn ustr(chars: *const c_char) -> Ustr {
+        let cs = unsafe { CStr::from_ptr(chars).to_string_lossy() };
+        Ustr::from(&cs)
+    }
 
-    handle.spawn(async move {
-        let channel = CHANNEL.1.clone_async();
-        while !CHANNEL.1.is_closed() {
-            match channel.recv().await {
-                Ok(message) => dispatcher.receive(message.event, message.data),
-                Err(err) => log::error!("Error receiving message: {}", err),
-            }
-        }
-    });
+    #[no_mangle]
+    pub extern "C" fn listen(address: Ustr, callback: extern "C" fn(*const u8)) {
+        address::verify_address(&address).expect("Invalid address");
+        let mut storage = CALLBACK_STORAGE.write();
+        (*storage).insert(address, Callback(callback));
+    }
 
-    Ok(handle)
-}
+    #[no_mangle]
+    pub extern "C" fn unlisten(address: Ustr) {
+        let mut storage = CALLBACK_STORAGE.write();
+        (*storage).remove(&address);
+    }
 
-/// Start a new thread and run the event loop in it.
-///
-/// The function returns a [`JoinHandle`], although if you try to join it, it will block your
-/// thread, because of the loop.
-pub fn start_thread<D: Dispatcher>(dispatcher: D) -> Result<JoinHandle<()>, Error> {
-    let channel = CHANNEL.1.clone();
+    #[no_mangle]
+    pub extern "C" fn send(address: Ustr, data: *const u8, data_size: usize) {
+        let storage = super::CALLBACK_STORAGE.read();
+        let matcher = Matcher::new(&address).expect("Invalid address pattern");
+        let data = unsafe { std::slice::from_raw_parts(data, data_size) };
+        let packet = rosc::decoder::decode_udp(data).expect("Error decoding OSC packet");
+        let data = match packet {
+            (_, OscPacket::Message(mut msg)) => msg.args.remove(0),
+            _ => panic!("Bundles are not supported"),
+        };
 
-    Ok(thread::spawn(move || {
-        while !channel.is_closed() {
-            match channel.recv() {
-                Ok(message) => dispatcher.receive(message.event, message.data),
-                Err(err) => log::error!("Error receiving message: {}", err),
-            }
-        }
-    }))
-}
-
-/// Stop all event loops.
-pub fn stop() {
-    CHANNEL.0.close();
-}
-
-pub(crate) fn async_runtime_handle() -> Handle {
-    TOKIO_RUNTIME.handle().clone()
-}
-
-#[derive(Debug)]
-struct Message {
-    event: Ustr,
-    data: Bytes,
-}
-
-/// Error type.
-#[derive(Error, Debug)]
-pub enum Error {
-    /// Error initializing callback storage.
-    #[error("Callback for event '{0}' is not registered.")]
-    CallbackNotFound(Ustr),
-    /// Error serializing data.
-    #[error("Error serializing data: {0}")]
-    SerializingData(#[from] bincode::Error),
+        storage
+            .iter()
+            .filter_map(|(key, val)| {
+                let address = OscAddress::new(key.to_string()).unwrap();
+                if matcher.match_address(&address) {
+                    Some(val)
+                } else {
+                    None
+                }
+            })
+            .for_each(|callback| {
+                callback.call(data.clone());
+            });
+    }
 }
